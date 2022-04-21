@@ -20,15 +20,11 @@ import { StorageService } from 'src/renderer/app/services/storage.service';
 import { TelemetryService } from 'src/renderer/app/services/telemetry.service';
 import { updateSettingsAction } from 'src/renderer/app/stores/actions';
 import { Store } from 'src/renderer/app/stores/store';
-import {
-  EnvironmentDescriptor,
-  Settings
-} from 'src/shared/models/settings.model';
+import { EnvironmentDescriptor } from 'src/shared/models/settings.model';
 
 @Injectable({ providedIn: 'root' })
 export class SettingsService {
   public oldLastMigration: number;
-  private storageKey = 'settings';
 
   constructor(
     private store: Store,
@@ -62,51 +58,49 @@ export class SettingsService {
    * @returns
    */
   public loadSettings(): Observable<any> {
-    return this.storageService
-      .loadData<PreMigrationSettings>(this.storageKey)
-      .pipe(
-        switchMap<
-          PreMigrationSettings,
-          Observable<{
-            settings: PreMigrationSettings;
-            environmentsList?: EnvironmentDescriptor[];
-          }>
-        >((settings) => {
-          // if we don't have an environments object in the settings we need to migrate to the new system
-          if (settings && !settings.environments) {
-            return from(MainAPI.invoke('APP_NEW_STORAGE_MIGRATION')).pipe(
-              map((environmentsList) => ({ environmentsList, settings }))
-            );
+    return this.storageService.loadSettings().pipe(
+      switchMap<
+        PreMigrationSettings,
+        Observable<{
+          settings: PreMigrationSettings;
+          environmentsList?: EnvironmentDescriptor[];
+        }>
+      >((settings) => {
+        // if we don't have an environments object in the settings we need to migrate to the new system
+        if (settings && !settings.environments) {
+          return from(MainAPI.invoke('APP_NEW_STORAGE_MIGRATION')).pipe(
+            map((environmentsList) => ({ environmentsList, settings }))
+          );
+        }
+
+        return of({ settings });
+      }),
+      tap(
+        (settingsData: {
+          settings: PreMigrationSettings;
+          environmentsList: EnvironmentDescriptor[];
+        }) => {
+          this.getOldSettings(settingsData.settings);
+
+          if (!settingsData.settings) {
+            this.telemetryService.setFirstSession();
           }
 
-          return of({ settings });
-        }),
-        tap(
-          (settingsData: {
-            settings: PreMigrationSettings;
-            environmentsList: EnvironmentDescriptor[];
-          }) => {
-            this.getOldSettings(settingsData.settings);
+          const validatedSchema = SettingsSchema.validate(
+            settingsData.settings
+          );
 
-            if (!settingsData.settings) {
-              this.telemetryService.setFirstSession();
-            }
-
-            const validatedSchema = SettingsSchema.validate(
-              settingsData.settings
-            );
-
-            this.updateSettings(
-              settingsData.environmentsList
-                ? {
-                    ...validatedSchema.value,
-                    environments: settingsData.environmentsList
-                  }
-                : validatedSchema.value
-            );
-          }
-        )
-      );
+          this.updateSettings(
+            settingsData.environmentsList
+              ? {
+                  ...validatedSchema.value,
+                  environments: settingsData.environmentsList
+                }
+              : validatedSchema.value
+          );
+        }
+      )
+    );
   }
 
   /**
@@ -122,11 +116,7 @@ export class SettingsService {
       debounceTime(500),
       distinctUntilChanged(IsEqual),
       mergeMap((settings) =>
-        this.storageService.saveData<Settings>(
-          settings,
-          'settings',
-          settings.storagePrettyPrint
-        )
+        this.storageService.saveSettings(settings, settings.storagePrettyPrint)
       )
     );
   }

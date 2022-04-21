@@ -2,36 +2,70 @@ import { FSWatcher, watch } from 'chokidar';
 import { info as logInfo } from 'electron-log';
 import { resolve } from 'path';
 import { getMainWindow } from 'src/main/libs/main-window';
+import { Config } from 'src/shared/config';
 
-const watchers: { UUID: string; filePath: string; watcher: FSWatcher }[] = [];
+const watchers: { UUID: string; watcher: FSWatcher }[] = [];
+const reWatchTimeouts: { [key in string]: NodeJS.Timeout } = {};
+const logPrefix = '[MAIN][WATCHER] ';
+
+const findExistingWatcher = (UUID: string) =>
+  watchers.findIndex((watcher) => watcher.UUID === UUID);
+
+const clearScheduledWatcher = (UUID: string) => {
+  if (reWatchTimeouts[UUID]) {
+    clearTimeout(reWatchTimeouts[UUID]);
+    delete reWatchTimeouts[UUID];
+  }
+};
 
 /**
- * Watch an environment file and notify renderer of any change
+ * Watch an environment file (after a delay) and notify renderer of any change
  *
  * @param filePath
  */
 export const watchEnvironmentFile = (UUID: string, filePath: string) => {
-  const watcher = watch(resolve(filePath)).on('change', (event, path) => {
-    logInfo(
-      `[MAIN][WATCHER] ${filePath}/${UUID} was modified externally. Notifying renderer process.`
-    );
-    getMainWindow().webContents.send(
-      'APP_FILE_EXTERNAL_CHANGE',
-      UUID,
-      filePath
-    );
-  });
+  // remove any previously scheduled watcher
+  clearScheduledWatcher(UUID);
 
-  watchers.push({ UUID, filePath, watcher });
+  if (findExistingWatcher(UUID) === -1) {
+    const watchTimeout = setTimeout(() => {
+      logInfo(`${logPrefix} watching ${filePath}/${UUID}`);
+
+      const watcher = watch(resolve(filePath), { atomic: true }).on(
+        'change',
+        () => {
+          logInfo(
+            `${logPrefix}${filePath}/${UUID} was modified externally, notifying renderer process`
+          );
+
+          getMainWindow().webContents.send(
+            'APP_FILE_EXTERNAL_CHANGE',
+            UUID,
+            filePath
+          );
+        }
+      );
+
+      watchers.push({ UUID, watcher });
+    }, Config.fileReWatchDelay);
+
+    reWatchTimeouts[UUID] = watchTimeout;
+  }
 };
 
-export const unwatchEnvironmentFile = async (filePathOrUUID: string) => {
-  const existingWatcherIndex = watchers.findIndex(
-    (watcher) =>
-      watcher.filePath === filePathOrUUID || watcher.UUID === filePathOrUUID
-  );
+/**
+ * Unwatch an environment file (mainly used before triggering a save and after closing a file)
+ *
+ * @param UUID
+ */
+export const unwatchEnvironmentFile = async (UUID: string) => {
+  clearScheduledWatcher(UUID);
+
+  const existingWatcherIndex = findExistingWatcher(UUID);
 
   if (existingWatcherIndex >= 0) {
+    logInfo(`${logPrefix} unwatching ${UUID}`);
+
     await watchers[existingWatcherIndex].watcher.close();
     watchers.splice(existingWatcherIndex, 1);
   }

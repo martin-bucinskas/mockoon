@@ -34,6 +34,10 @@ import {
 import { ServerInstance } from 'src/main/libs/server-management';
 import { readJSONData, writeJSONData } from 'src/main/libs/storage';
 import { applyUpdate } from 'src/main/libs/update';
+import {
+  unwatchEnvironmentFile,
+  watchEnvironmentFile
+} from 'src/main/libs/watch-file';
 
 declare const isTesting: boolean;
 
@@ -99,25 +103,48 @@ export const initIPCListeners = (mainWindow: BrowserWindow) => {
     applyUpdate();
   });
 
-  ipcMain.on('APP_WATCH_FILE', (event, uuid, filePath) => {
-    // watchEnvironmentFile(uuid, filePath);
-  });
-
-  ipcMain.handle('APP_UNWATCH_FILE', async (event, filePathOrUUID) => {
-    // return await unwatchEnvironmentFile(filePathOrUUID)
-  });
+  ipcMain.handle(
+    'APP_UNWATCH_FILE',
+    async (event, UUID) => await unwatchEnvironmentFile(UUID)
+  );
 
   ipcMain.handle('APP_GET_OS', () => process.platform);
 
   ipcMain.handle(
-    'APP_READ_JSON_DATA',
+    'APP_READ_ENVIRONMENT_DATA',
     async (event, path: string) => await readJSONData(path)
   );
 
+  /**
+   * Using a key 'settings' that will retrieve the settings from the user data storage folder:
+   * 'settings' --> /%USER_DATA%/mockoon/storage/settings.json
+   */
   ipcMain.handle(
-    'APP_WRITE_JSON_DATA',
-    async (event, data, path: string, storagePrettyPrint?: boolean) =>
-      await writeJSONData(data, path, storagePrettyPrint)
+    'APP_READ_SETTINGS_DATA',
+    async (event) => await readJSONData('settings')
+  );
+
+  ipcMain.handle(
+    'APP_WRITE_ENVIRONMENT_DATA',
+    async (event, data, path: string, storagePrettyPrint?: boolean) => {
+      logInfo('saving ipc', path);
+
+      unwatchEnvironmentFile(data.uuid);
+
+      await writeJSONData(data, path, storagePrettyPrint);
+
+      watchEnvironmentFile(data.uuid, path);
+    }
+  );
+
+  /**
+   * Using a key 'settings' that will save the settings to the user data storage folder:
+   * 'settings' --> /%USER_DATA%/mockoon/storage/settings.json
+   */
+  ipcMain.handle(
+    'APP_WRITE_SETTINGS_DATA',
+    async (event, data, storagePrettyPrint?: boolean) =>
+      await writeJSONData(data, 'settings', storagePrettyPrint)
   );
 
   ipcMain.handle(

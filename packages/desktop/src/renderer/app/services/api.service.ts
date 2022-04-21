@@ -112,16 +112,16 @@ export class ApiService {
     });
 
     // listen to file external changes
-    /* MainAPI.receive(
+    MainAPI.receive(
       'APP_FILE_EXTERNAL_CHANGE',
-      (previousUUID: string, environmentPath: string) => {
+      (UUID: string, environmentPath: string) => {
         this.zone.run(() => {
           this.environmentsService
-            .reloadEnvironment(previousUUID, environmentPath)
+            .notifyExternalChange(UUID, environmentPath)
             .subscribe();
         });
       }
-    ); */
+    );
 
     // listen to environments and enable/disable some menu entries
     this.store

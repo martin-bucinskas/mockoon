@@ -19,6 +19,8 @@ import {
   UnwrapLegacyExport
 } from '@mockoon/commons';
 import {
+  BehaviorSubject,
+  concat,
   EMPTY,
   forkJoin,
   from,
@@ -103,6 +105,15 @@ import { EnvironmentDescriptor } from 'src/shared/models/settings.model';
   providedIn: 'root'
 })
 export class EnvironmentsService extends Logger {
+  private environmentChangesNotified = false;
+  private environmentChanges$ = new BehaviorSubject<
+    {
+      UUID: string;
+      environmentPath: string;
+      name: string;
+    }[]
+  >([]);
+
   constructor(
     private dataService: DataService,
     private eventsService: EventsService,
@@ -148,18 +159,16 @@ export class EnvironmentsService extends Logger {
 
         return forkJoin(
           settings.environments.map((environmentItem) =>
-            this.storageService
-              .loadData<Environment>(environmentItem.path)
-              .pipe(
-                map((environment) =>
-                  environment
-                    ? {
-                        environment,
-                        path: environmentItem.path
-                      }
-                    : null
-                )
+            this.storageService.loadEnvironment(environmentItem.path).pipe(
+              map((environment) =>
+                environment
+                  ? {
+                      environment,
+                      path: environmentItem.path
+                    }
+                  : null
               )
+            )
           )
         );
       }),
@@ -185,12 +194,6 @@ export class EnvironmentsService extends Logger {
               // keep the first environment as active during load
               { activeEnvironment: environmentsData[0].environment }
             )
-          );
-
-          MainAPI.send(
-            'APP_WATCH_FILE',
-            environmentData.environment.uuid,
-            environmentData.path
           );
         });
 
@@ -248,29 +251,12 @@ export class EnvironmentsService extends Logger {
             )?.path
           })),
           filter((environmentInfo) => environmentInfo.path !== undefined),
-          // unwatch before saving
           mergeMap((environmentInfo) =>
-            from(MainAPI.invoke('APP_UNWATCH_FILE', environmentInfo.path)).pipe(
-              map(() => environmentInfo)
+            this.storageService.saveEnvironment(
+              environmentInfo.data,
+              environmentInfo.path,
+              settings.storagePrettyPrint
             )
-          ),
-          mergeMap((environmentInfo) =>
-            this.storageService
-              .saveData<Environment>(
-                environmentInfo.data,
-                environmentInfo.path,
-                settings.storagePrettyPrint
-              )
-              .pipe(
-                tap(() => {
-                  // re-watch after saving
-                  MainAPI.send(
-                    'APP_WATCH_FILE',
-                    environmentInfo.data.uuid,
-                    environmentInfo.path
-                  );
-                })
-              )
           )
         )
       )
@@ -278,40 +264,72 @@ export class EnvironmentsService extends Logger {
   }
 
   /**
-   * Reload an environment into the store when an external change is detected
+   * Ask for confirmation before reloading an environment that was changed externally
    *
-   * @param previousUUID
+   * @param UUID
    * @param environmentPath
+   * @returns
    */
-  public reloadEnvironment(previousUUID: string, environmentPath: string) {
-    const activeEnvironmentUUID = this.store.get('activeEnvironmentUUID');
-    const environments = this.store.get('environments');
-    const environmentIndex = environments.findIndex(
-      (environment) => environment.uuid === previousUUID
-    );
-    const environmentStatus = this.store.getEnvironmentStatus(previousUUID);
+  public notifyExternalChange(UUID: string, environmentPath: string) {
+    this.environmentChanges$.next([
+      ...this.environmentChanges$.value,
+      {
+        UUID,
+        environmentPath,
+        name: this.store
+          .get('environments')
+          .find((environment) => environment.uuid === UUID)?.name
+      }
+    ]);
 
-    const openOptions = {
-      start: environmentStatus.running,
-      insertAfterIndex: environmentIndex - 1,
-      activeEnvironment: null
-    };
+    // ensure we open the modal only once
+    if (!this.environmentChangesNotified) {
+      this.environmentChangesNotified = true;
 
-    // keep other environment active, if reloaded one wasn't the active one
-    if (activeEnvironmentUUID !== previousUUID) {
-      openOptions.activeEnvironment = this.store.getEnvironmentByUUID(
-        activeEnvironmentUUID
+      const confirmReload$ = new Subject<boolean>();
+
+      this.eventsService.confirmModalEvents.next({
+        title: 'External changes detected',
+        text: 'The following environments were modified outside Mockoon:',
+        sub: 'You can disable file monitoring in the application settings (Ctrl + Comma)',
+        confirmButtonText: 'Reload all',
+        cancelButtonText: 'Ignore',
+        subIcon: 'info',
+        subIconClass: 'text-primary',
+        list$: this.environmentChanges$.pipe(
+          map((environmentChanges) =>
+            environmentChanges.map(
+              (environmentChange) => environmentChange.name
+            )
+          )
+        ),
+        confirmed$: confirmReload$
+      });
+
+      return confirmReload$.pipe(
+        switchMap((confirmed) => {
+          this.environmentChangesNotified = false;
+
+          if (confirmed) {
+            const obs = this.environmentChanges$.value.map(
+              (environmentChange) =>
+                this.reloadEnvironment(
+                  environmentChange.UUID,
+                  environmentChange.environmentPath
+                )
+            );
+
+            this.environmentChanges$.next([]);
+
+            return concat(...obs);
+          }
+
+          return EMPTY;
+        })
       );
     }
 
-    return this.closeEnvironment(previousUUID).pipe(
-      switchMap(() => this.openEnvironment(environmentPath, openOptions)),
-      tap(() => {
-        this.logMessage('info', 'ENVIRONMENT_RELOADED', {
-          name: environments[environmentIndex].name
-        });
-      })
-    );
+    return EMPTY;
   }
 
   /**
@@ -404,8 +422,6 @@ export class EnvironmentsService extends Logger {
         if (newEnvironment.name === EnvironmentDefault.name) {
           newEnvironment.name = HumanizeText(filename);
         }
-
-        MainAPI.send('APP_WATCH_FILE', newEnvironment.uuid, filePath);
 
         this.store.update(
           addEnvironmentAction(newEnvironment, {
@@ -545,12 +561,10 @@ export class EnvironmentsService extends Logger {
         return true;
       }),
       switchMap((filePath) =>
-        this.storageService.loadData<Environment>(filePath).pipe(
+        this.storageService.loadEnvironment(filePath).pipe(
           switchMap((environment) => this.verifyData(environment)),
           tap((environment) => {
             this.validateAndAddToStore(environment, filePath, openParams);
-
-            MainAPI.send('APP_WATCH_FILE', environment.uuid, filePath);
           })
         )
       )
@@ -1007,6 +1021,38 @@ export class EnvironmentsService extends Logger {
   }
 
   /**
+   * Reload an environment into the store when an external change is detected
+   *
+   * @param UUID
+   * @param environmentPath
+   */
+  private reloadEnvironment(UUID: string, environmentPath: string) {
+    const activeEnvironmentUUID = this.store.get('activeEnvironmentUUID');
+    const environments = this.store.get('environments');
+    const environmentIndex = environments.findIndex(
+      (environment) => environment.uuid === UUID
+    );
+    const environmentStatus = this.store.getEnvironmentStatus(UUID);
+
+    const openOptions = {
+      start: environmentStatus.running,
+      insertAfterIndex: environmentIndex - 1,
+      activeEnvironment: null
+    };
+
+    // keep other environment active, if reloaded one wasn't the active one
+    if (activeEnvironmentUUID !== UUID) {
+      openOptions.activeEnvironment = this.store.getEnvironmentByUUID(
+        activeEnvironmentUUID
+      );
+    }
+
+    return this.closeEnvironment(UUID).pipe(
+      switchMap(() => this.openEnvironment(environmentPath, openOptions))
+    );
+  }
+
+  /**
    * Verify data is not too recent or is a mockoon file.
    * To be used in switchMap mostly.
    *
@@ -1024,7 +1070,7 @@ export class EnvironmentsService extends Logger {
     }
 
     if (IsLegacyExportData(environment)) {
-      const confirmImport$ = new Subject<void>();
+      const confirmImport$ = new Subject<boolean>();
 
       this.eventsService.confirmModalEvents.next({
         title: 'Legacy export format detected',
@@ -1036,11 +1082,13 @@ export class EnvironmentsService extends Logger {
       });
 
       return confirmImport$.pipe(
-        switchMap(() => {
-          const unwrappedEnvironments = UnwrapLegacyExport(environment);
+        switchMap((confirmed) => {
+          if (confirmed) {
+            const unwrappedEnvironments = UnwrapLegacyExport(environment);
 
-          if (unwrappedEnvironments.length) {
-            return of(unwrappedEnvironments[0]);
+            if (unwrappedEnvironments.length) {
+              return of(unwrappedEnvironments[0]);
+            }
           }
 
           return EMPTY;
@@ -1049,7 +1097,7 @@ export class EnvironmentsService extends Logger {
     }
 
     if (environment.lastMigration === undefined) {
-      const confirmed$ = new Subject<void>();
+      const confirmed$ = new Subject<boolean>();
 
       this.eventsService.confirmModalEvents.next({
         title: 'Confirm opening',
@@ -1060,7 +1108,9 @@ export class EnvironmentsService extends Logger {
         confirmed$
       });
 
-      return confirmed$.pipe(map(() => environment));
+      return confirmed$.pipe(
+        switchMap((confirmed) => (confirmed ? of(environment) : EMPTY))
+      );
     }
 
     return of(environment);
